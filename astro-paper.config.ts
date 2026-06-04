@@ -8,7 +8,7 @@ export default defineAstroPaperConfig({
     author: "Kapi buffet",
     profile: "https://satna.ing",
     ogImage: "default-og.jpg",
-    lang: "zh-CN",
+    lang: "en",
     timezone: "Asia/Shanghai",
     dir: "ltr",
   },
