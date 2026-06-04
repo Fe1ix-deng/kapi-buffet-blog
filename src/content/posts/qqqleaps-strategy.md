@@ -1,8 +1,7 @@
 ---
 title: QQQ LEAPS期权策略：用1/4资金实现80%持仓效果
 author: Kapi buffet
-pubDatetime: 2026-06-04T10:00:00.000Z
-modDatetime: 2026-06-04T10:00:00.000Z
+pubDatetime: 2026-06-04
 description: 中小登如何用LEAPS深度实值期权配合展期策略，以远低于正股的资金参与QQQ长期上涨，实现年化31%回报。
 featured: true
 draft: false
