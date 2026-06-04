@@ -4,7 +4,7 @@ export default defineAstroPaperConfig({
   site: {
     url: "https://blog.020023.xyz",
     title: "卡皮巴菲特笔记大全",
-    description: "可爱又迷人的183",
+    description: "可爱又迷人的正派角色",
     author: "Kapi buffet",
     profile: "https://satna.ing",
     ogImage: "default-og.jpg",
