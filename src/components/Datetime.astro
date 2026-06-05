@@ -2,6 +2,7 @@
 import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc";
 import timezone from "dayjs/plugin/timezone";
+import "dayjs/locale/zh-cn";
 import IconCalendar from "@/assets/icons/IconCalendar.svg";
 import config from "@/config";
 import { useTranslations } from "@/i18n";
@@ -25,7 +26,8 @@ const {
   timezone: postTimezone,
 } = Astro.props;
 
-const t = useTranslations(Astro.currentLocale);
+const locale = Astro.currentLocale ?? config.site.lang;
+const t = useTranslations(locale);
 
 const isModified = modDatetime && modDatetime > pubDatetime;
 
@@ -33,7 +35,9 @@ const datetime = dayjs(isModified ? modDatetime : pubDatetime).tz(
   postTimezone ?? config.site.timezone
 );
 
-const date = datetime.format("D MMM, YYYY");
+const date = locale.toLowerCase().startsWith("zh")
+  ? datetime.locale("zh-cn").format("YYYY年M月D日")
+  : datetime.format("D MMM, YYYY");
 ---
 
 <div
