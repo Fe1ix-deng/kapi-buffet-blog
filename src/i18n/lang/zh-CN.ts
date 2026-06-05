@@ -5,7 +5,6 @@ export default {
     home: "首页",
     posts: "文章",
     tags: "标签",
-    about: "关于",
     archives: "归档",
     search: "搜索",
   },
@@ -18,7 +17,6 @@ export default {
     tagLabel: "标签",
     backToTop: "回到顶部",
     goBack: "返回",
-    editPage: "编辑文章",
     previousPost: "上一篇",
     nextPost: "下一篇",
   },
@@ -32,10 +30,6 @@ export default {
     featured: "精选文章",
     recentPosts: "最新文章",
     allPosts: "全部文章",
-  },
-  footer: {
-    copyright: "版权所有",
-    allRightsReserved: "保留所有权利。",
   },
   pages: {
     tagTitle: "标签",

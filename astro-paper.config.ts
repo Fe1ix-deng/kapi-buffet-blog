@@ -22,10 +22,6 @@ export default defineAstroPaperConfig({
     dynamicOgImage: true,
     showArchives: true,
     showBackButton: true,
-    editPost: {
-      enabled: true,
-      url: "https://github.com/Fe1ix-deng/kapi-buffet-blog/edit/main/",
-    },
     search: "pagefind",
   },
   socials: [

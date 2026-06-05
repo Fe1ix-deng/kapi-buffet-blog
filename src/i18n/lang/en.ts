@@ -5,7 +5,6 @@ export default {
     home: "Home",
     posts: "Posts",
     tags: "Tags",
-    about: "About",
     archives: "Archives",
     search: "Search",
   },
@@ -18,7 +17,6 @@ export default {
     tagLabel: "Tags",
     backToTop: "Back to top",
     goBack: "Go back",
-    editPage: "Edit page",
     previousPost: "Previous Post",
     nextPost: "Next Post",
   },
@@ -32,10 +30,6 @@ export default {
     featured: "Featured",
     recentPosts: "Recent Posts",
     allPosts: "All Posts",
-  },
-  footer: {
-    copyright: "Copyright",
-    allRightsReserved: "All rights reserved.",
   },
   pages: {
     tagTitle: "Tag",

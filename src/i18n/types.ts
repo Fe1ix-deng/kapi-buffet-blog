@@ -3,7 +3,6 @@ export interface UIStrings {
     home: string;
     posts: string;
     tags: string;
-    about: string;
     archives: string;
     search: string;
   };
@@ -16,7 +15,6 @@ export interface UIStrings {
     tagLabel: string;
     backToTop: string;
     goBack: string;
-    editPage: string;
     previousPost: string;
     nextPost: string;
   };
@@ -30,10 +28,6 @@ export interface UIStrings {
     featured: string;
     recentPosts: string;
     allPosts: string;
-  };
-  footer: {
-    copyright: string;
-    allRightsReserved: string;
   };
   pages: {
     tagTitle: string;

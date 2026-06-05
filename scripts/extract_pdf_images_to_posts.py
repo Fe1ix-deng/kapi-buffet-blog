@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""Extract PDF images and insert them into matching blog posts.
+"""Place PDF images in posts using nearby PDF text as anchors.
 
 Requires:
     pip install pymupdf
 
 Default behavior:
     - Reads PDFs from pdf_files/
-    - Writes images to public/images/{pdf-stem}/01.jpg, 02.jpg, ...
-    - Matches posts in src/content/posts/ by date first, then title keywords
-    - Inserts image references every few paragraphs
+    - Matches each PDF to a post in src/content/posts/
+    - Extracts text blocks and image positions from the PDF
+    - Skips the first image in each PDF as the cover image
+    - Saves remaining images to public/images/{pdf-stem}/01.jpg, 02.jpg, ...
+    - Finds the nearest text block above each image and inserts the image after
+      the matching Markdown paragraph
+    - Clears old /images/ Markdown refs before inserting the new positions
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import io
 import re
+import shutil
+import string
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -28,7 +32,7 @@ import fitz
 
 DATE_RE = re.compile(r"(?P<date>\d{4}-\d{2}-\d{2})")
 FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n?", re.DOTALL)
-IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\((?P<src>/images/[^)]+)\)")
+IMAGE_PARAGRAPH_RE = re.compile(r"^\s*!\[[^\]]*\]\(/images/[^)]+\)\s*$")
 CHINESE_RE = re.compile(r"[\u4e00-\u9fff]+")
 ASCII_WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
@@ -47,7 +51,36 @@ class PostInfo:
     date: str | None
     title: str
     keywords: set[str]
-    searchable_text: str
+
+
+@dataclass(frozen=True)
+class TextBlock:
+    page_index: int
+    y0: float
+    y1: float
+    text: str
+
+
+@dataclass(frozen=True)
+class PdfImage:
+    page_index: int
+    x0: float
+    y0: float
+    y1: float
+    xref: int
+    order: int
+    anchor_text: str
+    anchor_candidates: tuple[str, ...]
+    image_bytes: bytes
+
+
+@dataclass
+class ImagePlacement:
+    image: PdfImage
+    url: str
+    paragraph_index: int | None = None
+    matched_anchor: str = ""
+    used_fallback: bool = False
 
 
 @dataclass
@@ -55,30 +88,22 @@ class ProcessResult:
     pdf: Path
     post: Path | None
     status: str
-    images_extracted: int = 0
-    images_inserted: int = 0
     score: float = 0.0
     reason: str = ""
+    images_found: int = 0
+    images_saved: int = 0
+    images_inserted: int = 0
+    fallback_inserted: int = 0
+    missing_anchors: list[str] = field(default_factory=list)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract images from PDFs and insert Markdown image refs into matching posts."
+        description="Extract PDF images and place them after matching Markdown anchor text."
     )
     parser.add_argument("--pdf-dir", type=Path, default=Path("pdf_files"))
     parser.add_argument("--posts-dir", type=Path, default=Path("src/content/posts"))
     parser.add_argument("--images-dir", type=Path, default=Path("public/images"))
-    parser.add_argument(
-        "--interval",
-        type=int,
-        default=4,
-        help="Insert one image after every N Markdown paragraphs. Default: 4.",
-    )
-    parser.add_argument(
-        "--overwrite-images",
-        action="store_true",
-        help="Rewrite existing extracted image files.",
-    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -93,9 +118,15 @@ def normalize_stem(stem: str) -> str:
     return stem.strip().lower()
 
 
+def normalize_for_match(text: str) -> str:
+    punctuation = string.punctuation + "，。！？；：、（）【】《》“”‘’·…￥—「」『』"
+    translation = str.maketrans("", "", punctuation)
+    return re.sub(r"\s+", "", text.lower().translate(translation))
+
+
 def tokenize(text: str) -> set[str]:
     tokens: set[str] = set()
-    compact = re.sub(r"\s+", "", text.lower())
+    compact = normalize_for_match(text)
 
     for word in ASCII_WORD_RE.findall(compact):
         if len(word) >= 2:
@@ -128,26 +159,23 @@ def parse_title(markdown: str) -> str:
 
 def build_pdf_info(pdf_path: Path) -> PdfInfo:
     stem = pdf_path.stem
-    title_part = normalize_stem(stem)
     return PdfInfo(
         path=pdf_path,
         stem=stem,
         date=extract_date(stem),
-        keywords=tokenize(title_part),
+        keywords=tokenize(normalize_stem(stem)),
     )
 
 
 def build_post_info(post_path: Path) -> PostInfo:
     markdown = read_text(post_path)
     title = parse_title(markdown)
-    date = extract_date(post_path.name) or extract_date(markdown)
     searchable = f"{post_path.stem} {title} {markdown[:1200]}"
     return PostInfo(
         path=post_path,
-        date=date,
+        date=extract_date(post_path.name) or extract_date(markdown),
         title=title,
         keywords=tokenize(searchable),
-        searchable_text=searchable,
     )
 
 
@@ -207,8 +235,12 @@ def find_matching_post(pdf: PdfInfo, posts: list[PostInfo]) -> tuple[PostInfo | 
     return None, best_score, "no confident match"
 
 
-def image_hash(image_bytes: bytes) -> str:
-    return hashlib.sha1(image_bytes).hexdigest()
+def clean_block_text(text: str) -> str:
+    return re.sub(r"\s+", "", text).strip()
+
+
+def anchor_from_text(text: str, length: int = 20) -> str:
+    return normalize_for_match(clean_block_text(text))[:length]
 
 
 def pixmap_to_jpeg_bytes(doc: fitz.Document, xref: int) -> bytes:
@@ -218,35 +250,105 @@ def pixmap_to_jpeg_bytes(doc: fitz.Document, xref: int) -> bytes:
     return pix.tobytes("jpeg")
 
 
-def extract_images(pdf_path: Path, output_dir: Path, overwrite: bool, dry_run: bool) -> list[Path]:
-    doc = fitz.open(pdf_path)
-    seen: set[str] = set()
-    images: list[bytes] = []
+def image_rects_for_page(page: fitz.Page, image: tuple) -> list[fitz.Rect]:
+    try:
+        bbox = page.get_image_bbox(image)
+    except Exception:
+        bbox = fitz.Rect()
 
-    for page in doc:
+    if bbox and not bbox.is_empty and not bbox.is_infinite:
+        return [bbox]
+
+    xref = image[0]
+    try:
+        return [rect for rect in page.get_image_rects(xref) if not rect.is_empty]
+    except Exception:
+        return []
+
+
+def extract_text_blocks_and_images(pdf_path: Path) -> tuple[list[TextBlock], list[PdfImage]]:
+    doc = fitz.open(pdf_path)
+    text_blocks: list[TextBlock] = []
+    image_candidates: list[tuple[int, float, float, float, int, int, bytes]] = []
+    image_order = 0
+
+    for page_index, page in enumerate(doc):
+        for block in page.get_text("blocks"):
+            if len(block) < 7:
+                continue
+            x0, y0, x1, y1, text, _block_no, block_type = block
+            if block_type != 0:
+                continue
+            cleaned = clean_block_text(str(text))
+            if len(normalize_for_match(cleaned)) < 4:
+                continue
+            text_blocks.append(TextBlock(page_index=page_index, y0=float(y0), y1=float(y1), text=cleaned))
+
         for image in page.get_images(full=True):
             xref = image[0]
-            jpeg_bytes = pixmap_to_jpeg_bytes(doc, xref)
-            digest = image_hash(jpeg_bytes)
-            if digest in seen:
-                continue
-            seen.add(digest)
-            images.append(jpeg_bytes)
+            for rect in image_rects_for_page(page, image):
+                image_order += 1
+                image_candidates.append(
+                    (
+                        page_index,
+                        float(rect.x0),
+                        float(rect.y0),
+                        float(rect.y1),
+                        xref,
+                        image_order,
+                        pixmap_to_jpeg_bytes(doc, xref),
+                    )
+                )
 
-    if not dry_run:
-        output_dir.mkdir(parents=True, exist_ok=True)
+    images: list[PdfImage] = []
+    sorted_candidates = sorted(image_candidates, key=lambda item: (item[0], item[2], item[1], item[5]))
+    for page_index, x0, y0, y1, xref, order, image_bytes in sorted_candidates:
+        anchor_blocks = find_anchor_blocks(text_blocks, page_index, y0)
+        anchor_candidates = unique_anchors(anchor_from_text(block.text) for block in anchor_blocks)
+        images.append(
+            PdfImage(
+                page_index=page_index,
+                x0=x0,
+                y0=y0,
+                y1=y1,
+                xref=xref,
+                order=order,
+                anchor_text=anchor_candidates[0] if anchor_candidates else "",
+                anchor_candidates=tuple(anchor_candidates),
+                image_bytes=image_bytes,
+            )
+        )
 
-    paths: list[Path] = []
-    for index, jpeg_bytes in enumerate(images, start=1):
-        image_path = output_dir / f"{index:02d}.jpg"
-        paths.append(image_path)
-        if dry_run:
+    return text_blocks, images
+
+
+def unique_anchors(anchors: object) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for anchor in anchors:
+        if not isinstance(anchor, str) or not anchor or anchor in seen:
             continue
-        if image_path.exists() and not overwrite:
-            continue
-        image_path.write_bytes(jpeg_bytes)
+        seen.add(anchor)
+        unique.append(anchor)
+    return unique
 
-    return paths
+
+def find_anchor_blocks(text_blocks: list[TextBlock], page_index: int, image_y0: float) -> list[TextBlock]:
+    same_page = [
+        block
+        for block in text_blocks
+        if block.page_index == page_index and block.y1 <= image_y0 and anchor_from_text(block.text)
+    ]
+    if same_page:
+        return sorted(same_page, key=lambda block: block.y1, reverse=True)[:8]
+
+    previous_page = [
+        block for block in text_blocks if block.page_index == page_index - 1 and anchor_from_text(block.text)
+    ]
+    if previous_page:
+        return sorted(previous_page, key=lambda block: block.y1, reverse=True)[:8]
+
+    return []
 
 
 def split_frontmatter(markdown: str) -> tuple[str, str]:
@@ -256,88 +358,114 @@ def split_frontmatter(markdown: str) -> tuple[str, str]:
     return match.group(0), markdown[match.end() :]
 
 
-def is_insertable_paragraph(paragraph: str) -> bool:
-    stripped = paragraph.strip()
-    if not stripped:
-        return False
-    if stripped.startswith("!") or stripped.startswith("|"):
-        return False
-    if stripped.startswith("```") or stripped.startswith("~~~"):
-        return False
-    if re.fullmatch(r"https?://\S+", stripped):
-        return False
-    return True
-
-
 def split_paragraphs(body: str) -> list[str]:
-    return re.split(r"\n{2,}", body.strip("\n"))
+    stripped = body.strip("\n")
+    if not stripped:
+        return []
+    return re.split(r"\n{2,}", stripped)
 
 
-def insert_image_refs(markdown: str, image_urls: list[str], interval: int) -> tuple[str, int]:
-    if not image_urls:
-        return markdown, 0
-
-    existing = set(IMAGE_REF_RE.findall(markdown))
-    pending_urls = [url for url in image_urls if url not in existing]
-    if not pending_urls:
-        return markdown, 0
-
+def remove_existing_image_refs(markdown: str) -> str:
     frontmatter, body = split_frontmatter(markdown)
-    paragraphs = split_paragraphs(body)
-    if not paragraphs:
-        return markdown, 0
+    paragraphs = [paragraph for paragraph in split_paragraphs(body) if not IMAGE_PARAGRAPH_RE.match(paragraph)]
+    new_body = "\n\n".join(paragraph.strip("\n") for paragraph in paragraphs).rstrip()
+    return frontmatter + (new_body + "\n" if new_body else "")
 
-    rebuilt: list[str] = []
-    inserted = 0
-    insertable_count = 0
-    in_code_block = False
 
-    for paragraph in paragraphs:
-        stripped = paragraph.strip()
-        rebuilt.append(paragraph)
+def find_anchor_paragraph(anchor: str, paragraphs: list[str]) -> tuple[int | None, str]:
+    normalized_paragraphs = [normalize_for_match(paragraph) for paragraph in paragraphs]
 
-        if stripped.startswith(("```", "~~~")):
-            in_code_block = not in_code_block
-
-        if in_code_block or not is_insertable_paragraph(paragraph):
+    for length in range(min(len(anchor), 20), 7, -1):
+        needle = anchor[:length]
+        if not needle:
             continue
+        for index, normalized in enumerate(normalized_paragraphs):
+            if needle in normalized:
+                return index, needle
 
-        insertable_count += 1
-        if insertable_count % interval == 0 and inserted < len(pending_urls):
-            url = pending_urls[inserted]
-            rebuilt.append(f"![{Path(url).stem}]({url})")
-            inserted += 1
+    best_index: int | None = None
+    best_score = 0.0
+    for index, normalized in enumerate(normalized_paragraphs):
+        if not normalized:
+            continue
+        window_size = min(max(len(anchor), 8), len(normalized))
+        for start in range(0, max(len(normalized) - window_size + 1, 1)):
+            window = normalized[start : start + window_size]
+            score = SequenceMatcher(None, anchor, window).ratio()
+            if score > best_score:
+                best_index = index
+                best_score = score
 
-    while inserted < len(pending_urls):
-        url = pending_urls[inserted]
-        rebuilt.append(f"![{Path(url).stem}]({url})")
-        inserted += 1
+    if best_index is not None and best_score >= 0.82:
+        return best_index, anchor
 
-    new_body = "\n\n".join(part.strip("\n") for part in rebuilt).rstrip() + "\n"
-    return frontmatter + new_body, inserted
+    return None, ""
 
 
-def public_image_url(images_dir: Path, image_path: Path) -> str:
-    public_root = Path("public")
-    relative = image_path
+def public_image_url(image_path: Path) -> str:
     try:
-        relative = image_path.relative_to(public_root)
+        relative = image_path.relative_to(Path("public"))
     except ValueError:
-        try:
-            relative = image_path.relative_to(images_dir.parent)
-        except ValueError:
-            relative = image_path
+        relative = image_path
     return "/" + relative.as_posix()
 
 
-def process_pdf(
-    pdf: PdfInfo,
-    posts: list[PostInfo],
-    images_dir: Path,
-    interval: int,
-    overwrite_images: bool,
-    dry_run: bool,
-) -> ProcessResult:
+def write_extracted_images(pdf: PdfInfo, images: list[PdfImage], images_dir: Path, dry_run: bool) -> list[str]:
+    output_dir = images_dir / pdf.stem
+    if not dry_run:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    urls: list[str] = []
+    for index, image in enumerate(images, start=1):
+        image_path = output_dir / f"{index:02d}.jpg"
+        urls.append(public_image_url(image_path))
+        if not dry_run:
+            image_path.write_bytes(image.image_bytes)
+    return urls
+
+
+def apply_placements(markdown: str, placements: list[ImagePlacement]) -> tuple[str, int, int, list[str]]:
+    cleaned = remove_existing_image_refs(markdown)
+    frontmatter, body = split_frontmatter(cleaned)
+    paragraphs = split_paragraphs(body)
+
+    placements_by_paragraph: dict[int, list[ImagePlacement]] = {}
+    missing: list[str] = []
+    fallback_count = 0
+    last_paragraph_index: int | None = None
+    for placement in placements:
+        paragraph_index = None
+        matched_anchor = ""
+        for anchor in placement.image.anchor_candidates or (placement.image.anchor_text,):
+            paragraph_index, matched_anchor = find_anchor_paragraph(anchor, paragraphs)
+            if paragraph_index is not None:
+                break
+        if paragraph_index is None:
+            if paragraphs:
+                paragraph_index = last_paragraph_index if last_paragraph_index is not None else 0
+                placement.used_fallback = True
+                fallback_count += 1
+            else:
+                missing.append(placement.image.anchor_text or "(no anchor text)")
+                continue
+        placement.paragraph_index = paragraph_index
+        placement.matched_anchor = matched_anchor
+        last_paragraph_index = paragraph_index
+        placements_by_paragraph.setdefault(paragraph_index, []).append(placement)
+
+    rebuilt: list[str] = []
+    inserted = 0
+    for index, paragraph in enumerate(paragraphs):
+        rebuilt.append(paragraph)
+        for placement in placements_by_paragraph.get(index, []):
+            rebuilt.append(f"![{Path(placement.url).stem}]({placement.url})")
+            inserted += 1
+
+    new_body = "\n\n".join(part.strip("\n") for part in rebuilt).rstrip()
+    return frontmatter + (new_body + "\n" if new_body else ""), inserted, fallback_count, missing
+
+
+def process_pdf(pdf: PdfInfo, posts: list[PostInfo], images_dir: Path, dry_run: bool) -> ProcessResult:
     post, score, reason = find_matching_post(pdf, posts)
     result = ProcessResult(pdf=pdf.path, post=post.path if post else None, status="", score=score, reason=reason)
 
@@ -345,28 +473,49 @@ def process_pdf(
         result.status = "unmatched"
         return result
 
-    output_dir = images_dir / pdf.stem
-    image_paths = extract_images(pdf.path, output_dir, overwrite_images, dry_run)
-    result.images_extracted = len(image_paths)
+    _text_blocks, images = extract_text_blocks_and_images(pdf.path)
+    result.images_found = len(images)
 
-    if not image_paths:
-        result.status = "matched_no_images"
+    images_to_place = images[1:]
+    if not images_to_place:
+        original = read_text(post.path)
+        updated = remove_existing_image_refs(original)
+        if not dry_run and updated != original:
+            post.path.write_text(updated, encoding="utf-8")
+        result.status = "matched_no_insertable_images"
         return result
 
-    image_urls = [public_image_url(images_dir, path) for path in image_paths]
+    urls = write_extracted_images(pdf, images_to_place, images_dir, dry_run)
+    placements = [ImagePlacement(image=image, url=url) for image, url in zip(images_to_place, urls)]
     original = read_text(post.path)
-    updated, inserted = insert_image_refs(original, image_urls, interval)
+    updated, inserted, fallback_count, missing = apply_placements(original, placements)
+
+    result.images_saved = len(urls)
     result.images_inserted = inserted
+    result.fallback_inserted = fallback_count
+    result.missing_anchors = missing
+    result.status = "matched" if not missing else "matched_with_missing_anchors"
 
-    if inserted == 0:
-        result.status = "matched_already_inserted"
-        return result
-
-    result.status = "matched"
     if not dry_run:
         post.path.write_text(updated, encoding="utf-8")
 
     return result
+
+
+def clear_images_dir(images_dir: Path, dry_run: bool) -> None:
+    if dry_run:
+        return
+    if images_dir.exists():
+        shutil.rmtree(images_dir)
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+
+def clean_all_post_image_refs(posts: list[PostInfo], dry_run: bool) -> None:
+    for post in posts:
+        original = read_text(post.path)
+        updated = remove_existing_image_refs(original)
+        if not dry_run and updated != original:
+            post.path.write_text(updated, encoding="utf-8")
 
 
 def print_report(results: list[ProcessResult], dry_run: bool) -> None:
@@ -376,6 +525,7 @@ def print_report(results: list[ProcessResult], dry_run: bool) -> None:
 
     matched = [result for result in results if result.post and result.status != "unmatched"]
     unmatched = [result for result in results if result.status == "unmatched"]
+    with_missing = [result for result in results if result.missing_anchors]
 
     print("\nMatched PDFs:")
     if not matched:
@@ -385,27 +535,28 @@ def print_report(results: list[ProcessResult], dry_run: bool) -> None:
             "  - "
             f"{result.pdf.name} -> {result.post.name} "
             f"({result.reason}, score={result.score:.2f}, "
-            f"images={result.images_extracted}, inserted={result.images_inserted}, "
+            f"pdf_images={result.images_found}, saved_after_cover={result.images_saved}, "
+            f"inserted={result.images_inserted}, fallback={result.fallback_inserted}, "
             f"status={result.status})"
         )
 
-    print("\nNeed manual handling:")
+    print("\nNeed manual PDF-to-post handling:")
     if not unmatched:
         print("  - None")
     for result in unmatched:
-        print(
-            "  - "
-            f"{result.pdf.name} "
-            f"({result.reason}, best_score={result.score:.2f})"
-        )
+        print(f"  - {result.pdf.name} ({result.reason}, best_score={result.score:.2f})")
+
+    print("\nNeed manual anchor handling:")
+    if not with_missing:
+        print("  - None")
+    for result in with_missing:
+        preview = "; ".join(anchor[:24] for anchor in result.missing_anchors[:5])
+        extra = "" if len(result.missing_anchors) <= 5 else f"; +{len(result.missing_anchors) - 5} more"
+        print(f"  - {result.pdf.name}: {len(result.missing_anchors)} missing anchors ({preview}{extra})")
 
 
 def main() -> int:
     args = parse_args()
-    if args.interval < 1:
-        print("--interval must be at least 1", file=sys.stderr)
-        return 2
-
     pdf_dir = args.pdf_dir
     posts_dir = args.posts_dir
     images_dir = args.images_dir
@@ -420,19 +571,12 @@ def main() -> int:
     pdfs = [build_pdf_info(path) for path in sorted(pdf_dir.glob("*.pdf"))]
     posts = [build_post_info(path) for path in sorted(posts_dir.glob("*.md"))]
 
-    results = [
-        process_pdf(
-            pdf=pdf,
-            posts=posts,
-            images_dir=images_dir,
-            interval=args.interval,
-            overwrite_images=args.overwrite_images,
-            dry_run=args.dry_run,
-        )
-        for pdf in pdfs
-    ]
+    clear_images_dir(images_dir, args.dry_run)
+    clean_all_post_image_refs(posts, args.dry_run)
 
+    results = [process_pdf(pdf=pdf, posts=posts, images_dir=images_dir, dry_run=args.dry_run) for pdf in pdfs]
     print_report(results, args.dry_run)
+
     return 0
 
 

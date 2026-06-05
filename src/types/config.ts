@@ -3,7 +3,7 @@ interface SiteConfig {
   url: string;
   /** Blog title shown in header and meta tags */
   title: string;
-  /** Short description used in SEO meta and RSS feed */
+  /** Short description used in SEO meta */
   description: string;
   /** Default post author name */
   author: string;
@@ -46,14 +46,6 @@ interface FeaturesConfig {
   showArchives?: boolean;
   /** Show back button on post detail pages. Defaults to true. */
   showBackButton?: boolean;
-  /** "Edit page" link shown on post detail pages. */
-  editPost?:
-    | {
-        enabled: true;
-        /** Base URL for the edit link, e.g. GitHub edit URL */
-        url: string;
-      }
-    | { enabled: false };
   /**
    * Search provider. "pagefind" ships in the base template.
    * Set to false to disable search entirely.
